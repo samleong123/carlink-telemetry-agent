@@ -1,0 +1,55 @@
+{
+  "name": "carlink-telemetry-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": "index.js",
+  "description": "CarLink Orange Pi Zero 3 TelemetryAgent integrating SIM7600G 4G/GPS, MPU6050 IMU, SSD1306 OLED, RC522 NFC validation, and DUDU BLE OBD-II",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node index.js check",
+    "ports": "node index.js ports",
+    "test-peripherals": "node test-peripherals.cjs",
+    "test": "node --test test/telemetry-agent.test.js",
+    "build:linux-arm64": "pkg --public --no-bytecode -t node18-linux-arm64 -o release/carlink-telemetry-agent . && cp release/carlink-telemetry-agent release/carlink-telemetry-agent-linux-arm64"
+  },
+  "pkg": {
+    "scripts": [
+      "commands.js",
+      "config.js",
+      "dtc-scan.js",
+      "health.js",
+      "modem.js",
+      "mqtt.js",
+      "obd.js",
+      "peripherals.js",
+      "telemetry.js"
+    ],
+    "assets": [
+      "package.json",
+      "carlink-device.example.json",
+      "carlink-telemetry.service"
+    ],
+    "targets": [
+      "node18-linux-arm64"
+    ]
+  },
+  "dependencies": {
+    "i2c-bus": "^5.2.3",
+    "node-ble": "1.13.0",
+    "node-red-contrib-raspi5-rc522": "1.1.5",
+    "oled-font-5x7": "^1.0.3",
+    "oled-i2c-bus": "^1.0.12",
+    "serialport": "^12.0.0",
+    "spi-device": "^3.1.2"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "overrides": {
+    "node-gyp": "^10.3.1"
+  }
+}

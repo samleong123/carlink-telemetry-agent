@@ -1,0 +1,11 @@
+{
+  "device_id": "00000000-0000-0000-0000-000000000001",
+  "organization_id": "00000000-0000-0000-0000-000000000001",
+  "obd_uuid": "00000000-0000-0000-0000-000000000001",
+  "obd_bluetooth_mac": "11:22:33:44:55:66",
+  "api_url": "https://api.carlink.example.com",
+  "broker_url": "wss://broker.carlink.example.com/ws",
+  "broker_username": "d-00000000000000000000000000000001",
+  "auth_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "plate": "ABC 1234"
+}

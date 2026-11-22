@@ -1,0 +1,17 @@
+[Unit]
+Description=CarLink Orange Pi Zero 3 TelemetryAgent
+After=network-online.target bluetooth.service ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/carlink/TelemetryAgent
+ExecStart=/usr/bin/node /opt/carlink/TelemetryAgent/index.js --config /opt/carlink/TelemetryAgent/carlink-device.json
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
