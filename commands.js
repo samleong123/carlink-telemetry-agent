@@ -237,12 +237,31 @@ export function createDeviceApi(config) {
 }
 
 /**
- * Scrubs raw DTC code arrays from telemetry before MQTT publishing or offline spooling,
- * replacing them with presence-only `vehicle.has_dtc_fault` and sending up to 10 unique
- * normal codes ephemerally to `/dtc-ai`.
+ * Preserves normalized `vehicle.dtc_codes` and `vehicle.has_dtc_fault`, scrubs internal
+ * AI/raw-scan fields, and sends up to 10 unique normal codes ephemerally to `/dtc-ai`.
  */
 export async function explainNormalDtcs(packet, rawCodes = [], api = null, onExplanation = null) {
-  const codes = [...new Set((rawCodes || []).filter((code) => CODE_RE.test(code)))];
+  const codes = [
+    ...new Set(
+      (rawCodes || [])
+        .filter((c) => typeof c === 'string')
+        .map((c) => c.trim().toUpperCase())
+        .filter((code) => CODE_RE.test(code)),
+    ),
+  ].slice(0, 100);
+
+  const normalizeCodeArray = (arr) =>
+    Array.isArray(arr)
+      ? [
+          ...new Set(
+            arr
+              .filter((c) => typeof c === 'string')
+              .map((c) => c.trim().toUpperCase())
+              .filter((c) => CODE_RE.test(c)),
+          ),
+        ].slice(0, 100)
+      : [];
+
   const scrub = (value) => {
     if (Array.isArray(value)) return value.map(scrub);
     if (!value || typeof value !== 'object') return value;
@@ -253,20 +272,29 @@ export async function explainNormalDtcs(packet, rawCodes = [], api = null, onExp
         continue;
       }
       if (key === 'dtc_codes') {
-        if ((Array.isArray(item) && item.length > 0) || out.has_dtc_fault === true) {
+        const normalized = normalizeCodeArray(item);
+        out.dtc_codes = normalized;
+        if (normalized.length > 0 || out.has_dtc_fault === true) {
           out.has_dtc_fault = true;
         }
         continue;
       }
-      if (/dtc|fault_codes|diagnostic_codes|scan_raw|scan_result/i.test(key)) continue;
+      if (/^(?:dtc_ai|fault_codes|diagnostic_codes|scan_raw|scan_result)$/i.test(key)) continue;
       out[key] = scrub(item);
     }
     return out;
   };
 
   const sanitized = scrub(packet);
-  if (codes.length > 0 && sanitized.vehicle) {
-    sanitized.vehicle.has_dtc_fault = true;
+  if (sanitized.vehicle) {
+    if (codes.length > 0) {
+      sanitized.vehicle.dtc_codes = [
+        ...new Set([...(sanitized.vehicle.dtc_codes || []), ...codes]),
+      ].slice(0, 100);
+      sanitized.vehicle.has_dtc_fault = true;
+    } else if (!Array.isArray(sanitized.vehicle.dtc_codes)) {
+      sanitized.vehicle.dtc_codes = [];
+    }
   }
 
   let explanationsFailed = 0;
@@ -281,7 +309,7 @@ export async function explainNormalDtcs(packet, rawCodes = [], api = null, onExp
     }
   }
 
-  return { packet: sanitized, explanations_failed: explanationsFailed, codes_discarded: codes.length };
+  return { packet: sanitized, explanations_failed: explanationsFailed, codes_discarded: 0 };
 }
 
 export class CommandPoller {

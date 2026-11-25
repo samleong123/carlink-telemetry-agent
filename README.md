@@ -91,8 +91,6 @@ The TelemetryAgent uses the Orange Pi Zero 3's 26-pin expansion header, USB host
 | **26** | `SPI1_CS1` (`spi1-cs1-spidev`) | RC522 `SDA / NSS` | Chip Select 1 (`/dev/spidev1.1`) |
 | **22** | `GPIO` (Reset) | RC522 `RST` | Hardware reset pin |
 
-<img width="2000" height="1769" alt="orange-pi-zero-3-wiring" src="https://github.com/user-attachments/assets/8d3eed46-8115-4be7-9bb4-48a8c57baa1c" />
-
 ### 2. USB & Wireless Peripherals
 
 - **SIM7600G 4G LTE / GNSS Module**:

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_CANDIDATES = [
   join(AGENT_DIR, 'carlink-device.json'),
+  join(AGENT_DIR, 'carlink-device.example.json'),
   '/etc/carlink/device.json',
 ];
 export const DEFAULT_STATE_PATH = join(AGENT_DIR, '.telemetry-state.json');

@@ -6,6 +6,19 @@ import { evaluateDrivingBehaviour } from './peripherals.js';
 export const EDGE_VERSION = 'telemetry-agent-1.0.0';
 const UTC_SECOND_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DTC_CODE_RE = /^[PCBU][0-3][0-9A-Fa-f]{3}$/;
+
+export function normalizeDtcCodes(codes) {
+  if (!Array.isArray(codes)) return [];
+  const seen = new Set();
+  for (const raw of codes) {
+    if (typeof raw !== 'string') continue;
+    const norm = raw.trim().toUpperCase();
+    if (DTC_CODE_RE.test(norm)) seen.add(norm);
+    if (seen.size >= 100) break;
+  }
+  return [...seen];
+}
 
 export function toWholeSecondUtc(dateOrMs = new Date()) {
   const date = dateOrMs instanceof Date ? dateOrMs : new Date(dateOrMs);
@@ -30,8 +43,15 @@ export function buildTelemetryPacket({
   const vehObj = vehicle ?? emptyVehicleSnapshot();
   const behObj = drivingBehaviour ?? evaluateDrivingBehaviour([], null, true);
 
-  // Strip any unexpected dtc_codes property if passed from an upstream vehicle snapshot.
-  const { dtc_codes: _ignoredDtcCodes, ...cleanVehicle } = vehObj;
+  const { dtc_codes: rawDtcCodes, ...restVehicle } = vehObj;
+  const cleanVehicle = { ...restVehicle };
+  if (rawDtcCodes !== undefined) {
+    const normalizedCodes = normalizeDtcCodes(rawDtcCodes);
+    cleanVehicle.dtc_codes = normalizedCodes;
+    if (normalizedCodes.length > 0) {
+      cleanVehicle.has_dtc_fault = true;
+    }
+  }
 
   const healthObj = deviceHealth ?? {
     cpu_temp_c: null,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -19,10 +19,14 @@ import {
 import { CommandPoller, createDeviceApi, explainNormalDtcs, verifyCommand } from '../commands.js';
 import { syncBootSettings } from '../index.js';
 import {
+  AtModem,
+  closeNmea,
+  closePort,
   formatGpsForServer,
   formatNetworkForServer,
   NmeaReports,
   normalizeSinrDb,
+  orderAtCandidates,
   parseLteBandNumber,
   parseMmcliModemJson,
   rankAtCandidates,
@@ -35,7 +39,14 @@ import {
   ManagedMqttTransport,
   tryDecodePacket,
 } from '../mqtt.js';
-import { FuelTracker, pidReplies } from '../obd.js';
+import {
+  appendObdLogEntry,
+  DEFAULT_OBD_LOG_PATH,
+  DEFAULT_OBD_LOG_RETENTION_MS,
+  FuelTracker,
+  pidReplies,
+  pruneObdLog,
+} from '../obd.js';
 import {
   convertMpu6050Raw,
   evaluateDrivingBehaviour,
@@ -49,7 +60,9 @@ import {
 } from '../telemetry.js';
 
 const AGENT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
-const DEVICE_JSON_PATH = join(AGENT_DIR, 'carlink-device.json');
+const DEVICE_JSON_PATH = existsSync(join(AGENT_DIR, 'carlink-device.json'))
+  ? join(AGENT_DIR, 'carlink-device.json')
+  : join(AGENT_DIR, 'carlink-device.example.json');
 
 test('loads and validates Pi/TelemetryAgent/carlink-device.json credentials and persists plate state', async () => {
   const raw = readFileSync(DEVICE_JSON_PATH, 'utf8');
@@ -218,7 +231,7 @@ test('converts MPU6050 14-byte sample and evaluates harsh driving thresholds', (
   assert.equal(disabled.harsh_braking, false);
 });
 
-test('builds schema-valid pi_snapshot_v1 packet, omits driver_session, and scrubs dtc_codes', async () => {
+test('builds schema-valid pi_snapshot_v1 packet, omits driver_session, and preserves dtc_codes', async () => {
   const stamp = toWholeSecondUtc(new Date('2026-11-19T15:20:00.890Z'));
   const packet = buildTelemetryPacket({
     serial: 'pi-00000000-0000-0000-0000-000000000001',
@@ -259,9 +272,9 @@ test('builds schema-valid pi_snapshot_v1 packet, omits driver_session, and scrub
     (exp) => explained.push(exp),
   );
 
-  assert.equal(codes_discarded, 1);
+  assert.equal(codes_discarded, 0);
   assert.equal(explained.length, 1);
-  assert.equal('dtc_codes' in sanitized.vehicle, false);
+  assert.deepEqual(sanitized.vehicle.dtc_codes, ['P0420']);
   assert.equal(sanitized.vehicle.has_dtc_fault, true);
   assert.equal('driver_session' in sanitized, false);
   assert.equal(validatePiTelemetryPacket(sanitized), null);
@@ -835,4 +848,190 @@ test('pidReplies parses ATH1 headers across CAN 11-bit, 29-bit, ISO 9141, and KW
   assert.equal(pidReplies('18DAF110 03 41 0D 25\r>', '0D', 1)[0]?.[0], 0x25);
   assert.equal(pidReplies('48 6B 10 41 0D 00 C4\r>', '0D', 1)[0]?.[0], 0);
   assert.equal(pidReplies('83 F1 10 02 41 0D 0A CS\r>'.replace('CS', ''), '0D', 1)[0]?.[0], 0x0a);
+});
+
+test('AtModem.dispose, closePort, and closeNmea detach listeners and destroy closed/errored ports', async () => {
+  const { EventEmitter } = await import('node:events');
+
+  const createMockPort = (isOpen) => {
+    const emitter = new EventEmitter();
+    emitter.path = '/dev/ttyUSB5';
+    emitter.isOpen = isOpen;
+    emitter.destroyed = false;
+    emitter.unpiped = [];
+    emitter.write = (_data, cb) => cb?.(null);
+    emitter.close = (cb) => {
+      emitter.isOpen = false;
+      cb?.(null);
+    };
+    emitter.unpipe = (target) => {
+      emitter.unpiped.push(target);
+    };
+    emitter.destroy = () => {
+      emitter.destroyed = true;
+    };
+    return emitter;
+  };
+
+  // Closed/errored port must still have AtModem listeners detached and destroy() invoked
+  const deadPort = createMockPort(false);
+  const modem = new AtModem(deadPort, 5000);
+  assert.equal(deadPort.listenerCount('data'), 1);
+  assert.equal(deadPort.listenerCount('error'), 1);
+  assert.equal(deadPort.listenerCount('close'), 1);
+
+  const openPort = createMockPort(true);
+  const activeModem = new AtModem(openPort, 5000);
+  const pendingCmd = activeModem.command('AT+CPSI?');
+  activeModem.dispose(new Error('Disposed during rotation'));
+  await assert.rejects(pendingCmd, /Disposed during rotation/);
+  assert.equal(openPort.listenerCount('data'), 0);
+  assert.equal(openPort.listenerCount('error'), 0);
+  assert.equal(openPort.listenerCount('close'), 0);
+
+  modem.dispose();
+  assert.equal(deadPort.listenerCount('data'), 0);
+  await closePort(deadPort);
+  assert.equal(deadPort.destroyed, true);
+
+  await closePort(openPort);
+  assert.equal(openPort.isOpen, false);
+  assert.equal(openPort.destroyed, true);
+
+  // closeNmea unpipes, removes parser listeners, and destroys parser + port
+  const nmeaPort = createMockPort(true);
+  const parser = new EventEmitter();
+  parser.destroyed = false;
+  parser.on('data', () => {});
+  parser.destroy = () => {
+    parser.destroyed = true;
+  };
+  await closeNmea({ port: nmeaPort, parser, reports: new NmeaReports() });
+  assert.deepEqual(nmeaPort.unpiped, [parser]);
+  assert.equal(parser.listenerCount('data'), 0);
+  assert.equal(parser.destroyed, true);
+  assert.equal(nmeaPort.destroyed, true);
+});
+
+test('orderAtCandidates keeps free secondary AT ports ahead of ModemManager primary port even when deprioritized', () => {
+  const ports = [
+    { path: '/dev/ttyUSB0', usbInterfaceNumber: 0 },
+    { path: '/dev/ttyUSB1', usbInterfaceNumber: 1 },
+    { path: '/dev/ttyUSB4', usbInterfaceNumber: 2 },
+    { path: '/dev/ttyUSB5', usbInterfaceNumber: 3 },
+  ];
+  const busyPorts = new Map([
+    ['/dev/ttyUSB4', ['ModemManager primary-port', 'open by ModemManager(812)']],
+  ]);
+  const ranked = rankAtCandidates(ports, {
+    busyPorts,
+    mmInfo: {
+      primaryPorts: new Set(['/dev/ttyUSB4']),
+      mmAtPorts: new Set(['/dev/ttyUSB4', '/dev/ttyUSB5']),
+      mmGpsPorts: new Set(['/dev/ttyUSB1']),
+    },
+  });
+
+  // Even after /dev/ttyUSB5 failed twice (deprioritizePath), do not rotate into ModemManager primary /dev/ttyUSB4
+  const ordered = orderAtCandidates(ranked, '/dev/ttyUSB5');
+  assert.deepEqual(
+    ordered.map((c) => c.path),
+    ['/dev/ttyUSB5'],
+  );
+
+  // When two free candidates exist, deprioritizePath moves behind the other free candidate only
+  const twoFreeRanked = rankAtCandidates(
+    [
+      ...ports,
+      { path: '/dev/ttyUSB6', usbInterfaceNumber: 4 },
+    ],
+    {
+      busyPorts,
+      mmInfo: {
+        primaryPorts: new Set(['/dev/ttyUSB4']),
+        mmAtPorts: new Set(['/dev/ttyUSB4', '/dev/ttyUSB5']),
+        mmGpsPorts: new Set(['/dev/ttyUSB1']),
+      },
+    },
+  );
+  const twoFreeOrdered = orderAtCandidates(twoFreeRanked, '/dev/ttyUSB5');
+  assert.deepEqual(
+    twoFreeOrdered.map((c) => c.path),
+    ['/dev/ttyUSB6', '/dev/ttyUSB5'],
+  );
+});
+
+test('appendObdLogEntry and pruneObdLog write raw OBD2 data with timestamp and MAC and enforce 4-hour retention', () => {
+  assert.equal(DEFAULT_OBD_LOG_PATH, join(AGENT_DIR, 'OBD2.log'));
+  assert.equal(DEFAULT_OBD_LOG_RETENTION_MS, 4 * 60 * 60 * 1000);
+
+  const tmp = mkdtempSync(join(tmpdir(), 'carlink-obd-log-'));
+  try {
+    const logPath = join(tmp, 'OBD2.log');
+    const nowMs = Date.parse('2026-11-25T21:45:00.000Z');
+    const expiredTs = new Date(nowMs - DEFAULT_OBD_LOG_RETENTION_MS - 60_000).toISOString();
+    const boundaryTs = new Date(nowMs - DEFAULT_OBD_LOG_RETENTION_MS + 60_000).toISOString();
+    const recentTs = new Date(nowMs).toISOString();
+
+    appendObdLogEntry(
+      {
+        timestamp: expiredTs,
+        mac: '11:22:33:44:55:66',
+        identity: 'ELM327 v1.5',
+        supportedMask: 0xbe3ea813,
+        raw: { '010C': '7E8 04 41 0C 0F A0\r>', '010D': '7E8 03 41 0D 28\r>' },
+        vehicle: { engine_rpm: 1000, speed_kmh: 40 },
+        dtcCodes: [],
+      },
+      { logPath, nowMs: Date.parse(expiredTs) },
+    );
+
+    appendObdLogEntry(
+      {
+        timestamp: boundaryTs,
+        mac: '11:22:33:44:55:66',
+        identity: 'ELM327 v1.5',
+        supportedMask: 0xbe3ea813,
+        raw: { '010C': '7E8 04 41 0C 1A F8\r>', ATRV: '13.9V\r>' },
+        vehicle: { engine_rpm: 1726, ecu_voltage_v: 13.9 },
+        dtcCodes: [],
+      },
+      { logPath, nowMs: Date.parse(boundaryTs) },
+    );
+
+    appendObdLogEntry(
+      {
+        timestamp: recentTs,
+        mac: '11:22:33:44:55:66',
+        identity: 'ELM327 v1.5',
+        supportedMask: 0xbe3ea813,
+        raw: { '010C': '7E8 04 41 0C 1E 00\r>', '03': '43 01 04 20\r>' },
+        vehicle: { engine_rpm: 1920, mil_on: true },
+        dtcCodes: ['P0420'],
+      },
+      { logPath, nowMs, forcePrune: true },
+    );
+
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n');
+    assert.equal(lines.length, 2);
+    assert.ok(lines.every((line) => line.includes('mac=11:22:33:44:55:66')));
+    assert.equal(lines[0].startsWith(`${boundaryTs} | mac=11:22:33:44:55:66 | `), true);
+    assert.equal(lines[1].startsWith(`${recentTs} | mac=11:22:33:44:55:66 | `), true);
+
+    const parsedLatest = JSON.parse(lines[1].split(' | ').slice(2).join(' | '));
+    assert.equal(parsedLatest.timestamp, recentTs);
+    assert.equal(parsedLatest.mac, '11:22:33:44:55:66');
+    assert.equal(parsedLatest.raw['010C'], '7E8 04 41 0C 1E 00\r>');
+    assert.equal(parsedLatest.raw['03'], '43 01 04 20\r>');
+    assert.deepEqual(parsedLatest.dtc_codes, ['P0420']);
+
+    // Pruning further in the future leaves only entries still within the 4-hour window
+    const remaining = pruneObdLog(logPath, {
+      retentionMs: DEFAULT_OBD_LOG_RETENTION_MS,
+      nowMs: nowMs + 120_000,
+    });
+    assert.equal(remaining, 1);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });

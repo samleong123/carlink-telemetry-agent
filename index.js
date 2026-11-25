@@ -306,6 +306,7 @@ async function runAgentMode(opts) {
   let obdCollector = null;
   let mqtt = null;
   let commandPoller = null;
+  let memTimer = null;
   let activeDriverSession = null;
   let nfcFeedback = null;
   let publishedTicks = 0;
@@ -319,6 +320,31 @@ async function runAgentMode(opts) {
   });
 
   const deviceApi = !opts.dryRun ? createDeviceApi(credentials) : null;
+
+  const toMB = (bytes) => (bytes / 1024 / 1024).toFixed(2);
+  const memIntervalMs = process.env.CARLINK_MEM_DEBUG === '1' ? 15_000 : 60_000;
+  memTimer = setInterval(() => {
+    const mem = process.memoryUsage();
+    const resources = {};
+    if (typeof process.getActiveResourcesInfo === 'function') {
+      for (const type of process.getActiveResourcesInfo()) {
+        resources[type] = (resources[type] || 0) + 1;
+      }
+    }
+    console.log(
+      '[MEMORY]',
+      JSON.stringify({
+        uptimeSeconds: Math.round(process.uptime()),
+        rssMB: toMB(mem.rss),
+        heapTotalMB: toMB(mem.heapTotal),
+        heapUsedMB: toMB(mem.heapUsed),
+        externalMB: toMB(mem.external),
+        arrayBuffersMB: toMB(mem.arrayBuffers),
+        activeResources: resources,
+      }),
+    );
+  }, memIntervalMs);
+  memTimer.unref?.();
 
   const getActiveDriverSession = (nowMs = Date.now()) => {
     if (!activeDriverSession || activeDriverSession.status !== 'active') return null;
@@ -334,6 +360,10 @@ async function runAgentMode(opts) {
   };
 
   const cleanupAll = async () => {
+    if (memTimer) {
+      clearInterval(memTimer);
+      memTimer = null;
+    }
     commandPoller?.stop();
     mqtt?.stop();
     await Promise.race([
@@ -553,6 +583,9 @@ async function runAgentMode(opts) {
   const healthMonitor = new DeviceHealthMonitor();
 
   let lastPublishedEpochSec = 0;
+  let explainInFlight = false;
+  const explainedDtcAt = new Map();
+  const DTC_EXPLAIN_COOLDOWN_MS = 10 * 60 * 1000;
 
   // Give BLE/I2C a brief moment for initial sample before first publish
   if (running) await Promise.race([sleep(300), stoppedPromise]);
@@ -604,8 +637,26 @@ async function runAgentMode(opts) {
 
     // Never block telemetry generation on DTC-AI HTTP calls when offline or slow
     const { packet: sanitized } = await explainNormalDtcs(rawPacket, obdSnapshot.dtcCodes, null);
-    if (!opts.dryRun && mqtt?.connected && obdSnapshot.dtcCodes?.length && commandPoller?.api) {
-      void explainNormalDtcs(rawPacket, obdSnapshot.dtcCodes, commandPoller.api).catch(() => {});
+    if (!opts.dryRun && mqtt?.connected && obdSnapshot.dtcCodes?.length && commandPoller?.api && !explainInFlight) {
+      const nowMs = Date.now();
+      const dueCodes = obdSnapshot.dtcCodes.filter((code) => {
+        const lastAt = explainedDtcAt.get(code);
+        return lastAt === undefined || nowMs - lastAt >= DTC_EXPLAIN_COOLDOWN_MS;
+      });
+      if (dueCodes.length > 0) {
+        explainInFlight = true;
+        for (const code of dueCodes) {
+          if (explainedDtcAt.size >= 100) {
+            explainedDtcAt.delete(explainedDtcAt.keys().next().value);
+          }
+          explainedDtcAt.set(code, nowMs);
+        }
+        void explainNormalDtcs(sanitized, dueCodes, commandPoller.api)
+          .catch(() => {})
+          .finally(() => {
+            explainInFlight = false;
+          });
+      }
     }
 
     const validationError = validatePiTelemetryPacket(sanitized);

@@ -14,7 +14,7 @@
     "ports": "node index.js ports",
     "test-peripherals": "node test-peripherals.cjs",
     "test": "node --test test/telemetry-agent.test.js",
-    "build:linux-arm64": "pkg --public --no-bytecode -t node18-linux-arm64 -o release/carlink-telemetry-agent . && cp release/carlink-telemetry-agent release/carlink-telemetry-agent-linux-arm64"
+    "build:linux-arm64": "npx --cache /tmp/npm-cache pkg@5.8.1 --public --no-bytecode -t node18-linux-arm64 -o release/carlink-telemetry-agent . && cp release/carlink-telemetry-agent release/carlink-telemetry-agent-linux-arm64"
   },
   "pkg": {
     "scripts": [

@@ -594,6 +594,7 @@ export class MinimalMqttClient {
   disconnect() {
     this.stopKeepAlive();
     this.pendingPubacks.clear();
+    this.recvBuf = Buffer.alloc(0);
     try {
       this.closeRaw?.();
     } catch {
@@ -602,6 +603,9 @@ export class MinimalMqttClient {
     if (!this.closed) {
       this.closed = true;
       this.emit('close', 1000);
+    }
+    for (const key of Object.keys(this.handlers)) {
+      this.handlers[key] = [];
     }
   }
 }

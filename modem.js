@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { readdir, readlink, realpath } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -28,17 +29,35 @@ export class AtModem {
   #buffer = '';
   #pending;
   #fatalError = null;
+  #onDataListener;
+  #onErrorListener;
+  #onCloseListener;
 
   constructor(port, timeoutMs = 5000) {
     this.port = port;
     this.timeoutMs = timeoutMs;
-    port.on('data', (chunk) => this.#onData(chunk));
-    port.on('error', (error) => this.#fatal(error));
-    port.on('close', (error) => this.#fatal(error ?? new Error('Serial port closed')));
+    this.#onDataListener = (chunk) => this.#onData(chunk);
+    this.#onErrorListener = (error) => this.#fatal(error);
+    this.#onCloseListener = (error) => this.#fatal(error ?? new Error('Serial port closed'));
+    port.on('data', this.#onDataListener);
+    port.on('error', this.#onErrorListener);
+    port.on('close', this.#onCloseListener);
   }
 
   get closed() {
     return this.#fatalError !== null || !this.port.isOpen;
+  }
+
+  dispose(reason = new Error('AT modem closed')) {
+    this.#fatal(reason);
+    this.#buffer = '';
+    const detach = (event, listener) => {
+      if (typeof this.port?.off === 'function') this.port.off(event, listener);
+      else if (typeof this.port?.removeListener === 'function') this.port.removeListener(event, listener);
+    };
+    detach('data', this.#onDataListener);
+    detach('error', this.#onErrorListener);
+    detach('close', this.#onCloseListener);
   }
 
   command(command, timeoutMs = this.timeoutMs) {
@@ -270,7 +289,7 @@ async function readContexts(query, lte) {
     });
 }
 
-export async function readNetwork(modem) {
+export async function readNetwork(modem, { includeContexts = false } = {}) {
   const query = (command, prefix) => queryRows(modem, command, prefix);
   const [rawCell] = await query('AT+CPSI?', '+CPSI:');
   const fields = csv(rawCell ?? '');
@@ -290,6 +309,9 @@ export async function readNetwork(modem) {
   const rssiDbm =
     Number.isInteger(rssiIndex) && rssiIndex >= 0 && rssiIndex <= 31 ? -113 + 2 * rssiIndex : null;
   const cell = servingCell(fields);
+  const isRegistered = registrationCode !== null && [1, 5].includes(registrationCode);
+  const dataContexts =
+    includeContexts || !isRegistered ? await readContexts(query, networkType === 'LTE') : [];
 
   return {
     networkType,
@@ -298,12 +320,12 @@ export async function readNetwork(modem) {
     operator: operator ?? null,
     accessTechnologyCode: optionalNumber(access),
     registrationCode,
-    registered: registrationCode === null ? null : [1, 5].includes(registrationCode),
+    registered: registrationCode === null ? null : isRegistered,
     roaming: registrationCode === null ? null : registrationCode === 5,
     rssiDbm: cell?.rssiDbm ?? rssiDbm,
     csqBerIndex: ber === '99' ? null : optionalNumber(ber),
     servingCell: cell,
-    dataContexts: await readContexts(query, networkType === 'LTE'),
+    dataContexts,
   };
 }
 
@@ -581,22 +603,58 @@ export class NmeaReports {
 export async function openNmea(SerialPort, ReadlineParser, path, baudRate) {
   const port = new SerialPort({ path, baudRate, autoOpen: false });
   const reports = new NmeaReports();
+  const parser = port.pipe(new ReadlineParser({ delimiter: '\n', maxBufferSize: 16384 }));
   port.on('error', (error) => console.error(`[SIM7600G NMEA] ${path}: ${error.message}`));
-  const parser = port.pipe(new ReadlineParser({ delimiter: '\n' }));
   parser.on('data', (line) => reports.receive(line));
-  await promisify(port.open).call(port);
-  return { port, reports };
+  try {
+    await promisify(port.open).call(port);
+    return { port, parser, reports };
+  } catch (error) {
+    await closeNmea({ port, parser, reports });
+    throw error;
+  }
+}
+
+export async function closeNmea(nmea) {
+  if (!nmea) return;
+  const { port, parser } = nmea;
+  if (parser) {
+    try {
+      port?.unpipe?.(parser);
+      parser.removeAllListeners?.();
+      parser.destroy?.();
+    } catch {
+      // Ignore parser cleanup errors
+    }
+  }
+  await closePort(port);
 }
 
 export async function closePort(port) {
-  if (!port || !port.isOpen) return;
+  if (!port) return;
+  let timer = null;
   try {
-    await Promise.race([
-      promisify(port.close).call(port),
-      sleep(1000),
-    ]);
+    if (port.isOpen) {
+      await Promise.race([
+        promisify(port.close).call(port).catch((error) => {
+          console.error(`[SIM7600G] Could not close ${port.path}: ${error.message}`);
+        }),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, 1000);
+          timer.unref?.();
+        }),
+      ]);
+    }
   } catch (error) {
     console.error(`[SIM7600G] Could not close ${port.path}: ${error.message}`);
+  } finally {
+    if (timer) clearTimeout(timer);
+    try {
+      port.removeAllListeners?.();
+      port.destroy?.();
+    } catch {
+      // Ignore destroy/cleanup errors
+    }
   }
 }
 
@@ -714,7 +772,6 @@ async function scanOpenSerialProcessFds() {
         if (!ttyMatches.length) return;
         let comm = `pid:${pid}`;
         try {
-          const { readFileSync } = await import('node:fs');
           comm = readFileSync(`/proc/${pid}/comm`, 'utf8').trim() || comm;
         } catch {
           // Ignore
@@ -867,9 +924,30 @@ async function connectAndIdentify(SerialPort, path, baudRate, detect) {
     }
     return modem;
   } catch (error) {
+    modem.dispose(error);
     await closePort(port);
     throw new Error(`${path}: ${error.message}`, { cause: error });
   }
+}
+
+export function orderAtCandidates(ranked, deprioritizePath = null) {
+  const deprioritizeSort = (a, b) =>
+    (a.path === deprioritizePath ? 1 : 0) - (b.path === deprioritizePath ? 1 : 0);
+  const freeCandidates = ranked
+    .filter((c) => !c.isBusy && !c.isMmPrimary && !c.isKnownGpsOrDiag)
+    .sort(deprioritizeSort);
+  const nonPrimaryFallbacks = ranked
+    .filter((c) => !c.isKnownGpsOrDiag && !c.isMmPrimary && !freeCandidates.includes(c))
+    .sort(deprioritizeSort);
+  const primaryFallbacks = ranked
+    .filter((c) => !c.isKnownGpsOrDiag && c.isMmPrimary && !freeCandidates.includes(c))
+    .sort(deprioritizeSort);
+
+  return freeCandidates.length > 0
+    ? freeCandidates
+    : nonPrimaryFallbacks.length > 0
+      ? nonPrimaryFallbacks
+      : primaryFallbacks;
 }
 
 export async function selectSim7600AtPort(
@@ -891,15 +969,7 @@ export async function selectSim7600AtPort(
 
   const topology = await inspectSerialTopology(SerialPort);
   const { ranked } = topology;
-  const freeCandidates = ranked.filter((c) => !c.isBusy && !c.isMmPrimary && !c.isKnownGpsOrDiag);
-  const fallbackAtCandidates = ranked.filter(
-    (c) => !c.isKnownGpsOrDiag && !freeCandidates.includes(c),
-  );
-  const ordered = [...freeCandidates, ...fallbackAtCandidates].sort((a, b) => {
-    const aDep = a.path === deprioritizePath ? 1 : 0;
-    const bDep = b.path === deprioritizePath ? 1 : 0;
-    return aDep - bDep;
-  });
+  const ordered = orderAtCandidates(ranked, deprioritizePath);
 
   const busySkipped = ranked
     .filter((c) => c.isBusy || c.isMmPrimary)
@@ -1103,6 +1173,9 @@ export class Sim7600Watcher {
   #polling = false;
   #consecutiveErrors = 0;
   #lastFailedAtPort = null;
+  #lastBusyPorts = new Map();
+  #lastNmeaAttemptAt = 0;
+  #lastConnectAttemptAt = 0;
 
   constructor({ portPath, baudRate = 115200, pollIntervalMs = 1000 } = {}) {
     this.explicitPort = portPath;
@@ -1135,12 +1208,20 @@ export class Sim7600Watcher {
     this.#timer.unref?.();
   }
 
-  async #ensureNmeaOpen(busyPorts = new Map()) {
+  async #ensureNmeaOpen(busyPorts = null, { force = false } = {}) {
+    if (this.#nmea && !this.#nmea.port?.isOpen) {
+      await this.#closeNmeaHandle();
+    }
     if (this.#nmea && this.#nmea.port?.isOpen) return;
     if (!this.#serialPortPkg) return;
+    const now = Date.now();
+    if (!force && now - this.#lastNmeaAttemptAt < 15_000) return;
+    this.#lastNmeaAttemptAt = now;
+
     const { SerialPort, ReadlineParser } = this.#serialPortPkg;
+    const effectiveBusyPorts = busyPorts ?? this.#lastBusyPorts;
     try {
-      const nmeaPath = await findFreeNmeaPort(SerialPort, this.atPortPath, busyPorts);
+      const nmeaPath = await findFreeNmeaPort(SerialPort, this.atPortPath, effectiveBusyPorts);
       if (nmeaPath) {
         this.#nmea = await openNmea(SerialPort, ReadlineParser, nmeaPath, this.baudRate);
         this.nmeaPortPath = nmeaPath;
@@ -1152,9 +1233,10 @@ export class Sim7600Watcher {
   }
 
   async #connectAndInit() {
+    this.#lastConnectAttemptAt = Date.now();
     const { SerialPort } = this.#serialPortPkg;
     // Always attempt to open the NMEA GPS stream even if all AT ports are busy
-    await this.#ensureNmeaOpen();
+    await this.#ensureNmeaOpen(null, { force: true });
 
     const { modem, topology, busySkipped } = await selectSim7600AtPort(
       SerialPort,
@@ -1165,6 +1247,9 @@ export class Sim7600Watcher {
     this.#modem = modem;
     this.atPortPath = modem.port.path;
     this.busySkipped = busySkipped;
+    if (topology?.busyState?.busyPorts) {
+      this.#lastBusyPorts = topology.busyState.busyPorts;
+    }
 
     try {
       const details = await readDetails(modem);
@@ -1179,7 +1264,7 @@ export class Sim7600Watcher {
       console.warn(`[SIM7600G] startGps warning on ${this.atPortPath}: ${error.message}`);
     }
 
-    await this.#ensureNmeaOpen(topology?.busyState?.busyPorts ?? new Map());
+    await this.#ensureNmeaOpen(this.#lastBusyPorts, { force: true });
   }
 
   async #pollOnce() {
@@ -1190,10 +1275,12 @@ export class Sim7600Watcher {
 
       if (!this.#modem || this.#modem.closed) {
         await this.closeAtHandle();
-        try {
-          await this.#connectAndInit();
-        } catch (connErr) {
-          this.lastError = connErr.message;
+        if (Date.now() - this.#lastConnectAttemptAt >= 5_000) {
+          try {
+            await this.#connectAndInit();
+          } catch (connErr) {
+            this.lastError = connErr.message;
+          }
         }
       }
 
@@ -1246,7 +1333,7 @@ export class Sim7600Watcher {
         this.lastError = null;
       } else {
         this.#consecutiveErrors++;
-        if (this.#consecutiveErrors >= 2 && this.#modem) {
+        if (this.#consecutiveErrors >= 3 && this.#modem) {
           console.warn(
             `[SIM7600G] AT port ${this.atPortPath} unresponsive (${this.lastError}); rotating/reconnecting AT port...`,
           );
@@ -1259,7 +1346,7 @@ export class Sim7600Watcher {
       this.#consecutiveErrors++;
       this.lastError = error.message;
       console.error(`[SIM7600G] Watch poll error (${this.#consecutiveErrors}): ${error.message}`);
-      if (this.#consecutiveErrors >= 2) {
+      if (this.#consecutiveErrors >= 3) {
         this.#lastFailedAtPort = this.atPortPath;
         await this.closeAtHandle();
         this.#consecutiveErrors = 0;
@@ -1287,8 +1374,17 @@ export class Sim7600Watcher {
     };
   }
 
+  async #closeNmeaHandle() {
+    if (this.#nmea) {
+      await closeNmea(this.#nmea);
+      this.#nmea = null;
+      this.nmeaPortPath = null;
+    }
+  }
+
   async closeAtHandle() {
     if (this.#modem) {
+      this.#modem.dispose();
       await closePort(this.#modem.port);
       this.#modem = null;
       this.atPortPath = null;
@@ -1296,11 +1392,7 @@ export class Sim7600Watcher {
   }
 
   async closeHandles() {
-    if (this.#nmea) {
-      await closePort(this.#nmea.port);
-      this.#nmea = null;
-      this.nmeaPortPath = null;
-    }
+    await this.#closeNmeaHandle();
     await this.closeAtHandle();
   }
 
@@ -1320,7 +1412,7 @@ export async function runModemCheck({ portPath, baudRate = 115200 } = {}) {
   try {
     const details = await readDetails(modem);
     await startGps(modem);
-    const network = await readNetwork(modem);
+    const network = await readNetwork(modem, { includeContexts: true });
     const gps = await readGnss(modem);
     return {
       atPort: modem.port.path,
@@ -1330,6 +1422,7 @@ export async function runModemCheck({ portPath, baudRate = 115200 } = {}) {
       gps,
     };
   } finally {
+    modem.dispose();
     await closePort(modem.port);
   }
 }

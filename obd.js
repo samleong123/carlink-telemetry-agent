@@ -1,8 +1,118 @@
 import { execFile } from 'node:child_process';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { decodeDtc } from './dtc-scan.js';
+
+const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
+export const DEFAULT_OBD_LOG_PATH = join(AGENT_DIR, 'OBD2.log');
+export const DEFAULT_OBD_LOG_RETENTION_MS = 4 * 60 * 60 * 1000;
+const OBD_LOG_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
+const OBD_LOG_MAX_BYTES = 16 * 1024 * 1024;
+const lastObdPruneAt = new Map();
+
+export function formatObdLogLine({
+  timestamp = new Date().toISOString(),
+  mac = null,
+  identity = null,
+  supportedMask = null,
+  raw = {},
+  vehicle = null,
+  dtcCodes = [],
+}) {
+  const payload = {
+    timestamp,
+    mac: mac || null,
+    identity: identity || null,
+    supported_mask:
+      typeof supportedMask === 'number' && supportedMask > 0
+        ? `0x${supportedMask.toString(16).toUpperCase()}`
+        : null,
+    raw: raw && typeof raw === 'object' ? raw : {},
+    vehicle: vehicle ?? null,
+    dtc_codes: Array.isArray(dtcCodes) ? dtcCodes : [],
+  };
+  return `${timestamp} | mac=${mac || 'unknown'} | ${JSON.stringify(payload)}\n`;
+}
+
+export function pruneObdLog(
+  logPath = DEFAULT_OBD_LOG_PATH,
+  { retentionMs = DEFAULT_OBD_LOG_RETENTION_MS, nowMs = Date.now() } = {},
+) {
+  if (!logPath || !existsSync(logPath)) return 0;
+  const rawText = readFileSync(logPath, 'utf8');
+  if (!rawText) return 0;
+
+  const cutoffMs = nowMs - retentionMs;
+  const kept = [];
+  for (const line of rawText.split(/\r?\n/)) {
+    if (!line) continue;
+    const sep = line.indexOf(' | ');
+    const tsStr = sep === -1 ? line : line.slice(0, sep);
+    const ts = Date.parse(tsStr);
+    if (Number.isFinite(ts) && ts >= cutoffMs) {
+      kept.push(line);
+    }
+  }
+
+  const dir = dirname(resolve(logPath));
+  mkdirSync(dir, { recursive: true });
+  const tmpPath = `${logPath}.tmp-${process.pid}`;
+  writeFileSync(tmpPath, kept.length ? `${kept.join('\n')}\n` : '', { mode: 0o600 });
+  try {
+    chmodSync(tmpPath, 0o600);
+  } catch {
+    // Ignore on non-POSIX
+  }
+  renameSync(tmpPath, logPath);
+  return kept.length;
+}
+
+export function appendObdLogEntry(
+  entry,
+  {
+    logPath = DEFAULT_OBD_LOG_PATH,
+    retentionMs = DEFAULT_OBD_LOG_RETENTION_MS,
+    nowMs = Date.now(),
+    forcePrune = false,
+  } = {},
+) {
+  if (!logPath) return;
+  try {
+    const dir = dirname(resolve(logPath));
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(logPath, formatObdLogLine(entry), { mode: 0o600 });
+
+    const lastPrune = lastObdPruneAt.get(logPath) ?? 0;
+    let oversize = false;
+    try {
+      oversize = statSync(logPath).size >= OBD_LOG_MAX_BYTES;
+    } catch {
+      // Ignore stat failures
+    }
+    if (forcePrune || oversize || nowMs - lastPrune >= OBD_LOG_PRUNE_INTERVAL_MS) {
+      if (lastObdPruneAt.size >= 16) {
+        lastObdPruneAt.delete(lastObdPruneAt.keys().next().value);
+      }
+      lastObdPruneAt.set(logPath, nowMs);
+      pruneObdLog(logPath, { retentionMs, nowMs });
+    }
+  } catch (err) {
+    console.warn(`[OBD LOG] Could not write ${logPath}: ${err.message}`);
+  }
+}
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_DUDU_MAC = null;
@@ -216,14 +326,24 @@ export class BleObdCollector {
   #lastDtcCheckAt = 0;
   #diagnosticHeader = null;
   #diagnosticProtocol = null;
+  #logPath;
+  #logRetentionMs;
 
-  constructor({ mac, enabled = true, onConfigurationUpdate } = {}) {
+  constructor({
+    mac,
+    enabled = true,
+    onConfigurationUpdate,
+    logPath = process.env.CARLINK_OBD_LOG_PATH || DEFAULT_OBD_LOG_PATH,
+    logRetentionMs = DEFAULT_OBD_LOG_RETENTION_MS,
+  } = {}) {
     this.#mac = String(mac || DEFAULT_DUDU_MAC || '').toUpperCase();
     this.activeMac = this.#mac;
     this.identity = null;
     this.#enabled =
       enabled && process.platform === 'linux' && /^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(this.#mac);
     this.onConfigurationUpdate = onConfigurationUpdate;
+    this.#logPath = logPath;
+    this.#logRetentionMs = logRetentionMs;
     this.lastError = null;
   }
 
@@ -412,14 +532,17 @@ export class BleObdCollector {
       release = res;
     });
     await prev;
+    const rawReadings = {};
+    let snap = null;
     try {
       if (this.#paused || !this.#connected) return;
-      const snap = emptyVehicleSnapshot();
+      snap = emptyVehicleSnapshot();
       snap.obd_connected = true;
 
       if (this.#supportedMask === 0) {
         try {
           const raw0100 = await this.#sendRaw('0100', 5000);
+          rawReadings['0100'] = raw0100;
           const masks = pidReplies(raw0100, '00', 4);
           if (masks.length > 0) {
             this.#supportedMask = masks[0].readUInt32BE(0);
@@ -427,14 +550,21 @@ export class BleObdCollector {
               `[OBD] Vehicle ECU responded to 0100 (bitmask=0x${this.#supportedMask.toString(16).toUpperCase()})`,
             );
           }
-        } catch {
-          // ECU still asleep / ignition OFF
+        } catch (err) {
+          rawReadings['0100'] = `ERROR: ${err.message}`;
         }
       }
 
       if (this.#supportedMask === 0) {
         snap.engine_running = false;
-        snap.ecu_voltage_v = parseAtrvVoltage(await this.#sendRaw('ATRV', 3000));
+        try {
+          const rawAtrv = await this.#sendRaw('ATRV', 3000);
+          rawReadings.ATRV = rawAtrv;
+          snap.ecu_voltage_v = parseAtrvVoltage(rawAtrv);
+        } catch (err) {
+          rawReadings.ATRV = `ERROR: ${err.message}`;
+          throw err;
+        }
         this.#latestVehicle = snap;
         return;
       }
@@ -443,8 +573,10 @@ export class BleObdCollector {
         if (!this.#supportsLowPid(pid)) return null;
         try {
           const raw = await this.#sendRaw(`01${pid}`, 4000);
+          rawReadings[`01${pid}`] = raw;
           return pidReplies(raw, pid, size)[0] ?? null;
-        } catch {
+        } catch (err) {
+          rawReadings[`01${pid}`] = `ERROR: ${err.message}`;
           return null;
         }
       };
@@ -490,7 +622,14 @@ export class BleObdCollector {
       if (voltBuf) {
         snap.ecu_voltage_v = clamp(Number(((256 * voltBuf[0] + voltBuf[1]) / 1000).toFixed(2)), 0, 100);
       } else {
-        snap.ecu_voltage_v = parseAtrvVoltage(await this.#sendRaw('ATRV', 3000));
+        try {
+          const rawAtrv = await this.#sendRaw('ATRV', 3000);
+          rawReadings.ATRV = rawAtrv;
+          snap.ecu_voltage_v = parseAtrvVoltage(rawAtrv);
+        } catch (err) {
+          rawReadings.ATRV = `ERROR: ${err.message}`;
+          throw err;
+        }
       }
 
       const milBuf = await readPid('01', 4);
@@ -500,8 +639,14 @@ export class BleObdCollector {
         snap.has_dtc_fault = dtcCount > 0 || snap.mil_on;
         if (dtcCount > 0 && Date.now() - this.#lastDtcCheckAt > 60_000) {
           this.#lastDtcCheckAt = Date.now();
-          const dtcRaw = await this.#sendRaw('03', 6000);
-          this.#latestDtcCodes = parseMode03Dtcs(dtcRaw);
+          try {
+            const dtcRaw = await this.#sendRaw('03', 6000);
+            rawReadings['03'] = dtcRaw;
+            this.#latestDtcCodes = parseMode03Dtcs(dtcRaw);
+          } catch (err) {
+            rawReadings['03'] = `ERROR: ${err.message}`;
+            throw err;
+          }
         } else if (dtcCount === 0) {
           this.#latestDtcCodes = [];
         }
@@ -516,6 +661,23 @@ export class BleObdCollector {
 
       this.#latestVehicle = snap;
     } finally {
+      if (this.#logPath && Object.keys(rawReadings).length > 0) {
+        appendObdLogEntry(
+          {
+            timestamp: new Date().toISOString(),
+            mac: this.activeMac || this.#mac,
+            identity: this.identity,
+            supportedMask: this.#supportedMask,
+            raw: rawReadings,
+            vehicle: snap,
+            dtcCodes: this.#latestDtcCodes,
+          },
+          {
+            logPath: this.#logPath,
+            retentionMs: this.#logRetentionMs,
+          },
+        );
+      }
       release();
     }
   }
@@ -623,29 +785,57 @@ export class BleObdCollector {
     this.#diagnosticProtocol = null;
     this.#latestVehicle = emptyVehicleSnapshot();
     this.#latestDtcCodes = [];
-    await Promise.race([
-      (async () => {
-        try {
-          await this.#rx?.stopNotifications().catch(() => {});
-        } catch {
-          // Ignore
-        }
-        try {
-          await this.#device?.disconnect().catch(() => {});
-        } catch {
-          // Ignore
-        }
-        try {
-          await this.#adapter?.stopDiscovery().catch(() => {});
-        } catch {
-          // Ignore
-        }
-      })(),
-      sleep(1200),
-    ]);
+    let timer = null;
+    try {
+      await Promise.race([
+        (async () => {
+          try {
+            await this.#rx?.stopNotifications().catch(() => {});
+          } catch {
+            // Ignore
+          }
+          try {
+            this.#rx?.removeAllListeners?.();
+          } catch {
+            // Ignore
+          }
+          try {
+            await this.#device?.disconnect().catch(() => {});
+          } catch {
+            // Ignore
+          }
+          try {
+            this.#device?.removeAllListeners?.();
+          } catch {
+            // Ignore
+          }
+          try {
+            await this.#adapter?.stopDiscovery().catch(() => {});
+          } catch {
+            // Ignore
+          }
+        })(),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, 1200);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     this.#tx = null;
     this.#rx = null;
     this.#device = null;
+    this.#adapter = null;
+    if (this.#destroy) {
+      try {
+        this.#destroy();
+      } catch {
+        // Ignore
+      }
+      this.#destroy = null;
+      this.#bluetooth = null;
+    }
   }
 
   async stop() {
