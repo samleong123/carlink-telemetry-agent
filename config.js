@@ -3,7 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
-const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
+const AGENT_DIR = process.pkg ? dirname(process.execPath) : dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_CANDIDATES = [
   join(AGENT_DIR, 'carlink-device.json'),
   join(AGENT_DIR, 'carlink-device.example.json'),

@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { decodeDtc } from './dtc-scan.js';
 
-const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
+const AGENT_DIR = process.pkg ? dirname(process.execPath) : dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_OBD_LOG_PATH = join(AGENT_DIR, 'OBD2.log');
 export const DEFAULT_OBD_LOG_RETENTION_MS = 4 * 60 * 60 * 1000;
 const OBD_LOG_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
@@ -637,17 +637,19 @@ export class BleObdCollector {
         snap.mil_on = Boolean(milBuf[0] & 0x80);
         const dtcCount = milBuf[0] & 0x7f;
         snap.has_dtc_fault = dtcCount > 0 || snap.mil_on;
-        if (dtcCount > 0 && Date.now() - this.#lastDtcCheckAt > 60_000) {
+        if (dtcCount > 0 && (this.#latestDtcCodes.length === 0 || Date.now() - this.#lastDtcCheckAt > 60_000)) {
           this.#lastDtcCheckAt = Date.now();
           try {
             const dtcRaw = await this.#sendRaw('03', 6000);
             rawReadings['03'] = dtcRaw;
-            this.#latestDtcCodes = parseMode03Dtcs(dtcRaw);
+            const parsedDtcs = parseMode03Dtcs(dtcRaw);
+            if (parsedDtcs.length > 0) {
+              this.#latestDtcCodes = parsedDtcs;
+            }
           } catch (err) {
             rawReadings['03'] = `ERROR: ${err.message}`;
-            throw err;
           }
-        } else if (dtcCount === 0) {
+        } else if (dtcCount === 0 && !snap.mil_on) {
           this.#latestDtcCodes = [];
         }
       }
@@ -783,6 +785,7 @@ export class BleObdCollector {
     this.#connected = false;
     this.#diagnosticHeader = null;
     this.#diagnosticProtocol = null;
+    this.#lastDtcCheckAt = 0;
     this.#latestVehicle = emptyVehicleSnapshot();
     this.#latestDtcCodes = [];
     let timer = null;

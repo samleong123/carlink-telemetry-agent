@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 
-const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
+const AGENT_DIR = process.pkg ? dirname(process.execPath) : dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_SPOOL_PATH = join(AGENT_DIR, '.telemetry-spool.json');
 
 export function encodeRemainingLength(length) {
