@@ -10,11 +10,14 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { decodeDtc } from './dtc-scan.js';
+
+const require = createRequire(import.meta.url);
 
 const AGENT_DIR = process.pkg ? dirname(process.execPath) : dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_OBD_LOG_PATH = join(AGENT_DIR, 'OBD2.log');
@@ -422,7 +425,7 @@ export class BleObdCollector {
   }
 
   async #connectOnce() {
-    const { default: { createBluetooth } } = await import('node-ble');
+    const { createBluetooth } = require('node-ble');
     if (!this.#bluetooth) {
       const ble = createBluetooth();
       this.#bluetooth = ble.bluetooth;

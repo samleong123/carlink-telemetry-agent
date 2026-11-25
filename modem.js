@@ -1,10 +1,13 @@
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { readdir, readlink, realpath } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
+
+const require = createRequire(import.meta.url);
 
 const execFileAsync = promisify(execFile);
 const USB_SERIAL_RE = /^\/dev\/tty(?:USB|ACM)\d+$/;
@@ -1190,9 +1193,11 @@ export class Sim7600Watcher {
   }
 
   async start() {
-    this.#serialPortPkg = await import('serialport').catch((error) => {
+    try {
+      this.#serialPortPkg = require('serialport');
+    } catch (error) {
       throw new Error(`serialport dependency missing (${error.message})`);
-    });
+    }
     try {
       await this.#connectAndInit();
       await this.#pollOnce();
@@ -1407,7 +1412,7 @@ export class Sim7600Watcher {
 }
 
 export async function runModemCheck({ portPath, baudRate = 115200 } = {}) {
-  const { SerialPort } = await import('serialport');
+  const { SerialPort } = require('serialport');
   const { modem, busySkipped } = await selectSim7600AtPort(SerialPort, portPath, baudRate);
   try {
     const details = await readDetails(modem);
@@ -1428,7 +1433,7 @@ export async function runModemCheck({ portPath, baudRate = 115200 } = {}) {
 }
 
 export async function listPortsReport() {
-  const { SerialPort } = await import('serialport');
+  const { SerialPort } = require('serialport');
   const topology = await inspectSerialTopology(SerialPort);
   return {
     serialPorts: topology.rawList,

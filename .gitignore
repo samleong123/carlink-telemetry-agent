@@ -1,7 +1,28 @@
-node_modules
-/node_modules
-/node_modules/*
+# Dependencies
+/node_modules/
+
+# Device credentials & secrets
+carlink-device.json
+*.key
+*.pem
+*.secret
+
+# Runtime state & local spools
+.telemetry-state.json
+.telemetry-state.json.*
+.telemetry-spool.json
+.telemetry-spool.json.*
+
+# System & editor files
+.DS_Store
+Thumbs.db
+*.log
+.npm/
+
+# Build caches & temp files
+.pkg-stage/
+*.tmp*
+release/*.tmp*
 release
 /release
 /release/*
-.DS_Store
